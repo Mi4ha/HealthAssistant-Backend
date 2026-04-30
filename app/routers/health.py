@@ -6,9 +6,11 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import HealthReportRecord
-from ..schemas import HealthReportHistoryItem, HealthReportResponse
+from ..schemas import HealthReportContent, HealthReportHistoryItem, HealthReportResponse
 from ..services.ai import (
+    analyze_health_profile,
     build_rag_context,
+    build_personalized_rag_query,
     extract_food_info_from_image,
     generate_health_report_llm,
     save_upload_to_tempfile,
@@ -18,6 +20,29 @@ from .auth import oauth2_scheme
 
 
 router = APIRouter(prefix="/health", tags=["health"])
+
+
+def _parse_report_content(raw_report: str) -> HealthReportContent:
+    try:
+        payload = json.loads(raw_report)
+        if isinstance(payload, dict):
+            return HealthReportContent(
+                summary=payload.get("summary", "").strip(),
+                calorie_assessment=payload.get("calorie_assessment", "").strip(),
+                diet_suggestions=payload.get("diet_suggestions", []) or [],
+                exercise_suggestions=payload.get("exercise_suggestions", []) or [],
+                cautions=payload.get("cautions", []) or [],
+            )
+    except Exception:
+        pass
+
+    return HealthReportContent(
+        summary=raw_report,
+        calorie_assessment="该历史记录生成于旧版本，暂不包含结构化热量评估。",
+        diet_suggestions=[],
+        exercise_suggestions=[],
+        cautions=[],
+    )
 
 
 @router.post(
@@ -56,12 +81,20 @@ def health_report(
     temp_path = save_upload_to_tempfile(image.filename, image.file.read())
     try:
         food_info = extract_food_info_from_image(temp_path)
-        food_name = food_info.food_names[0] if food_info.food_names else "食物"
-        rag_query = f"{food_name}吃多了，高脂高热量饮食后如何补救？"
-        medical_context = build_rag_context(rag_query, top_k=2)
-        report = generate_health_report_llm(
+        analysis = analyze_health_profile(
             user_profile=user_profile,
             food_info=food_info,
+        )
+        rag_query = build_personalized_rag_query(
+            user_profile=user_profile,
+            food_info=food_info,
+            analysis=analysis,
+        )
+        medical_context = build_rag_context(rag_query, top_k=2)
+        report_payload = generate_health_report_llm(
+            user_profile=user_profile,
+            food_info=food_info,
+            analysis=analysis,
             medical_context=medical_context,
         )
         record = HealthReportRecord(
@@ -75,11 +108,23 @@ def health_report(
             used_height_cm=height_value,
             used_weight_kg=weight_value,
             medical_context=medical_context,
-            report=report,
+            report=json.dumps(report_payload, ensure_ascii=False),
         )
         db.add(record)
         db.commit()
-        return HealthReportResponse(food_info=food_info, report=report)
+        references = [line.strip() for line in medical_context.splitlines() if line.strip()][:3]
+        return HealthReportResponse(
+            food_info=food_info,
+            profile_summary=analysis["profile_summary"],
+            metrics=analysis["metrics"],
+            risk_tags=analysis["risk_tags"],
+            summary=report_payload["summary"],
+            calorie_assessment=report_payload["calorie_assessment"],
+            diet_suggestions=report_payload["diet_suggestions"],
+            exercise_suggestions=report_payload["exercise_suggestions"],
+            cautions=report_payload["cautions"],
+            references=references,
+        )
     finally:
         try:
             temp_path.unlink(missing_ok=True)
@@ -116,7 +161,8 @@ def list_health_reports(
             step_calories=record.step_calories,
             used_height_cm=record.used_height_cm,
             used_weight_kg=record.used_weight_kg,
-            report=record.report,
+            report=_parse_report_content(record.report),
+            references=[line.strip() for line in (record.medical_context or "").splitlines() if line.strip()][:3],
             created_at=record.created_at,
         )
         for record in records

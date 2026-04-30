@@ -42,9 +42,35 @@ class FoodInfo(BaseModel):
     calories: float
 
 
+class HealthMetrics(BaseModel):
+    bmi: Optional[float] = None
+    bmi_status: str
+    estimated_resting_kcal: Optional[float] = None
+    daily_steps: int
+    step_calories: int
+    food_calories: float
+    meal_activity_gap_kcal: float
+
+
 class HealthReportResponse(BaseModel):
     food_info: FoodInfo
-    report: str
+    profile_summary: str
+    metrics: HealthMetrics
+    risk_tags: List[str]
+    summary: str
+    calorie_assessment: str
+    diet_suggestions: List[str]
+    exercise_suggestions: List[str]
+    cautions: List[str]
+    references: List[str]
+
+
+class HealthReportContent(BaseModel):
+    summary: str
+    calorie_assessment: str
+    diet_suggestions: List[str]
+    exercise_suggestions: List[str]
+    cautions: List[str]
 
 
 class HealthReportHistoryItem(BaseModel):
@@ -56,7 +82,8 @@ class HealthReportHistoryItem(BaseModel):
     step_calories: int
     used_height_cm: int
     used_weight_kg: float
-    report: str
+    report: HealthReportContent
+    references: List[str]
     created_at: datetime
 
 
@@ -70,6 +97,7 @@ class ChatResponse(BaseModel):
     answer: str
     references: List[str]
     used_profile: bool
+    used_recent_report: bool
 
 
 class ChatHistoryItem(BaseModel):
@@ -80,4 +108,5 @@ class ChatHistoryItem(BaseModel):
     daily_steps: Optional[int] = None
     step_calories: Optional[int] = None
     used_profile: bool
+    used_recent_report: bool
     created_at: datetime

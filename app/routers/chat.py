@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..models import ChatRecord, HealthReportRecord
 from ..schemas import ChatHistoryItem, ChatRequest, ChatResponse
-from ..services.ai import build_rag_context, generate_health_chat_answer
+from ..services.ai import build_rag_result, generate_health_chat_answer
 from ..services.auth import get_current_user_or_401
 from .auth import oauth2_scheme
 
@@ -67,15 +67,14 @@ def health_chat(
         .first()
     )
     recent_report_context = _build_recent_report_context(recent_report)
-    medical_context = build_rag_context(payload.question, top_k=3)
-    references = [line.strip() for line in medical_context.splitlines() if line.strip()]
-
     user_profile = {
         "height_cm": user.height_cm,
         "weight_kg": user.weight_kg,
         "daily_steps": payload.daily_steps,
         "step_calories": payload.step_calories,
     }
+    rag_result = build_rag_result(payload.question, top_k=5, user_profile=user_profile)
+    medical_context = rag_result.context
     answer = generate_health_chat_answer(
         question=payload.question,
         user_profile=user_profile,
@@ -84,7 +83,7 @@ def health_chat(
     )
     response = ChatResponse(
         answer=answer,
-        references=references[:3],
+        references=rag_result.references[:5],
         used_profile=bool(user.height_cm or user.weight_kg),
         used_recent_report=recent_report is not None,
     )

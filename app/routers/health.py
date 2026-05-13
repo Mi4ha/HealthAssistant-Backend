@@ -9,8 +9,8 @@ from ..models import HealthReportRecord
 from ..schemas import HealthReportContent, HealthReportHistoryItem, HealthReportResponse
 from ..services.ai import (
     analyze_health_profile,
-    build_rag_context,
     build_personalized_rag_query,
+    build_rag_result,
     extract_food_info_from_image,
     generate_health_report_llm,
     save_upload_to_tempfile,
@@ -90,7 +90,8 @@ def health_report(
             food_info=food_info,
             analysis=analysis,
         )
-        medical_context = build_rag_context(rag_query, top_k=2)
+        rag_result = build_rag_result(rag_query, top_k=5, user_profile=user_profile)
+        medical_context = rag_result.context
         report_payload = generate_health_report_llm(
             user_profile=user_profile,
             food_info=food_info,
@@ -112,7 +113,6 @@ def health_report(
         )
         db.add(record)
         db.commit()
-        references = [line.strip() for line in medical_context.splitlines() if line.strip()][:3]
         return HealthReportResponse(
             food_info=food_info,
             profile_summary=analysis["profile_summary"],
@@ -123,7 +123,7 @@ def health_report(
             diet_suggestions=report_payload["diet_suggestions"],
             exercise_suggestions=report_payload["exercise_suggestions"],
             cautions=report_payload["cautions"],
-            references=references,
+            references=rag_result.references[:5],
         )
     finally:
         try:

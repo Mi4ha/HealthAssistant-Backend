@@ -1,4 +1,7 @@
 import json
+import logging
+import threading
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -20,6 +23,20 @@ from .auth import oauth2_scheme
 
 
 router = APIRouter(prefix="/health", tags=["health"])
+logger = logging.getLogger("uvicorn.error")
+
+
+def _remove_tempfile_with_retry(path):
+    for attempt in range(1, 6):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            time.sleep(0.5 * attempt)
+        except Exception:
+            logger.warning("failed to remove upload tempfile: %s", path, exc_info=True)
+            return
+    logger.warning("upload tempfile is still locked after retries: %s", path)
 
 
 def _parse_report_content(raw_report: str) -> HealthReportContent:
@@ -59,6 +76,20 @@ def health_report(
     daily_steps: int = Form(...),
     step_calories: Optional[int] = Form(None),
 ):
+    request_started_at = time.perf_counter()
+    last_step_at = request_started_at
+
+    def log_step(step: str) -> None:
+        nonlocal last_step_at
+        now = time.perf_counter()
+        logger.info(
+            "health_report step=%s elapsed=%.2fs total=%.2fs",
+            step,
+            now - last_step_at,
+            now - request_started_at,
+        )
+        last_step_at = now
+
     user = get_current_user_or_401(token=token, db=db)
 
     height_value = height if height is not None else user.height_cm
@@ -78,13 +109,20 @@ def health_report(
         "step_calories": step_calories_value,
     }
 
-    temp_path = save_upload_to_tempfile(image.filename, image.file.read())
+    temp_path = None
     try:
+        temp_path = save_upload_to_tempfile(image.filename, image.file.read())
+        log_step("save_upload")
+
         food_info = extract_food_info_from_image(temp_path)
+        log_step("vlm_food_detection")
+
         analysis = analyze_health_profile(
             user_profile=user_profile,
             food_info=food_info,
         )
+        log_step("local_health_analysis")
+
         rag_query = build_personalized_rag_query(
             user_profile=user_profile,
             food_info=food_info,
@@ -92,12 +130,16 @@ def health_report(
         )
         rag_result = build_rag_result(rag_query, top_k=5, user_profile=user_profile)
         medical_context = rag_result.context
+        log_step("rag_search")
+
         report_payload = generate_health_report_llm(
             user_profile=user_profile,
             food_info=food_info,
             analysis=analysis,
             medical_context=medical_context,
         )
+        log_step("llm_report_generation")
+
         record = HealthReportRecord(
             user_id=user.id,
             image_filename=image.filename,
@@ -113,6 +155,8 @@ def health_report(
         )
         db.add(record)
         db.commit()
+        log_step("db_commit")
+
         return HealthReportResponse(
             food_info=food_info,
             profile_summary=analysis["profile_summary"],
@@ -126,10 +170,19 @@ def health_report(
             references=rag_result.references[:5],
         )
     finally:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except PermissionError:
+                threading.Thread(
+                    target=_remove_tempfile_with_retry,
+                    args=(temp_path,),
+                    name="upload-tempfile-cleanup",
+                    daemon=True,
+                ).start()
+            except Exception:
+                logger.warning("failed to remove upload tempfile: %s", temp_path, exc_info=True)
+        logger.info("health_report finished total=%.2fs", time.perf_counter() - request_started_at)
 
 
 @router.get(

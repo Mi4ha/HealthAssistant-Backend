@@ -1,7 +1,10 @@
 import hashlib
 import json
+import logging
 import shutil
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,6 +13,14 @@ from fastapi import HTTPException, status
 
 from ..config import CHROMA_PERSIST_DIR, DASHSCOPE_API_KEY, KNOWLEDGE_DIR
 from ..schemas import FoodInfo, HealthMetrics
+
+logger = logging.getLogger("uvicorn.error")
+_VECTORSTORE_SCHEMA_VERSION = 2
+_embeddings_lock = threading.Lock()
+_embeddings_cache = None
+_vectorstore_lock = threading.Lock()
+_vectorstore_cache = None
+_vectorstore_cache_signature: Optional[str] = None
 
 
 def extract_food_info_from_image(image_path: Path) -> FoodInfo:
@@ -40,17 +51,25 @@ def extract_food_info_from_image(image_path: Path) -> FoodInfo:
         },
     ]
 
-    try:
-        response = MultiModalConversation.call(
-            api_key=DASHSCOPE_API_KEY,
-            model="qvq-max",
-            messages=messages,
-            stream=True,
-        )
-    except Exception as exc:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            response = MultiModalConversation.call(
+                api_key=DASHSCOPE_API_KEY,
+                model="qvq-max",
+                messages=messages,
+                stream=True,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            logger.warning("VLM call failed on attempt %d/3: %s", attempt, exc)
+            if attempt < 3:
+                time.sleep(attempt * 2)
+    else:
         raise HTTPException(
             status_code=502,
-            detail=f"VLM 调用异常：{type(exc).__name__}: {exc}",
+            detail=f"VLM 调用异常：{type(last_error).__name__}: {last_error}",
         )
 
     buffer = ""
@@ -65,13 +84,13 @@ def extract_food_info_from_image(image_path: Path) -> FoodInfo:
 
     text = buffer.strip()
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
+        payload = _extract_json_payload(text)
+        return FoodInfo(**payload)
+    except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"VLM 返回的 JSON 解析失败：{exc}; 原始输出：{text[:200]}",
+            detail=f"VLM 返回的 JSON 解析失败：{type(exc).__name__}: {exc}; 原始输出：{text[:200]}",
         )
-    return FoodInfo(**payload)
 
 
 
@@ -172,6 +191,41 @@ def _knowledge_signature(files: List[Path]) -> str:
     return digest.hexdigest()
 
 
+def _load_vectorstore_manifest(manifest_path: Path) -> Optional[Dict[str, Any]]:
+    if not manifest_path.exists():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _vectorstore_is_current(signature: str, manifest: Optional[Dict[str, Any]]) -> bool:
+    return (
+        (CHROMA_PERSIST_DIR / "chroma.sqlite3").exists()
+        and bool(manifest)
+        and manifest.get("signature") == signature
+        and manifest.get("schema_version") == _VECTORSTORE_SCHEMA_VERSION
+    )
+
+
+def _get_dashscope_embeddings():
+    global _embeddings_cache
+
+    if _embeddings_cache is not None:
+        return _embeddings_cache
+
+    with _embeddings_lock:
+        if _embeddings_cache is None:
+            from langchain_community.embeddings import DashScopeEmbeddings
+
+            _embeddings_cache = DashScopeEmbeddings(
+                dashscope_api_key=DASHSCOPE_API_KEY,
+                model="text-embedding-v4",
+            )
+        return _embeddings_cache
+
+
 def _build_documents(files: List[Path]):
     from langchain_core.documents import Document
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -208,52 +262,85 @@ def _build_documents(files: List[Path]):
 
 
 def _ensure_vectorstore(embeddings):
+    global _vectorstore_cache, _vectorstore_cache_signature
+
     from langchain_community.vectorstores import Chroma
 
     files = _knowledge_files()
     signature = _knowledge_signature(files)
     manifest_path = CHROMA_PERSIST_DIR / "knowledge_manifest.json"
-    current_manifest = None
-    if manifest_path.exists():
-        try:
-            current_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            current_manifest = None
 
-    needs_rebuild = (
-        not (CHROMA_PERSIST_DIR / "chroma.sqlite3").exists()
-        or not current_manifest
-        or current_manifest.get("signature") != signature
-        or current_manifest.get("schema_version") != 2
-    )
-    if needs_rebuild:
-        if CHROMA_PERSIST_DIR.exists():
-            shutil.rmtree(CHROMA_PERSIST_DIR)
-        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-        vectorstore = Chroma.from_documents(
-            documents=_build_documents(files),
-            embedding=embeddings,
-            persist_directory=str(CHROMA_PERSIST_DIR),
-        )
-        manifest_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 2,
-                    "signature": signature,
-                    "document_count": len(files),
-                    "files": [str(path.relative_to(KNOWLEDGE_DIR)) for path in files],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+    current_manifest = _load_vectorstore_manifest(manifest_path)
+    if (
+        _vectorstore_cache is not None
+        and _vectorstore_cache_signature == signature
+        and _vectorstore_is_current(signature, current_manifest)
+    ):
+        return _vectorstore_cache
+
+    with _vectorstore_lock:
+        current_manifest = _load_vectorstore_manifest(manifest_path)
+        if (
+            _vectorstore_cache is not None
+            and _vectorstore_cache_signature == signature
+            and _vectorstore_is_current(signature, current_manifest)
+        ):
+            logger.info("using cached Chroma vectorstore")
+            return _vectorstore_cache
+
+        if not _vectorstore_is_current(signature, current_manifest):
+            started_at = time.perf_counter()
+            logger.info("rebuilding Chroma vectorstore for %d knowledge files", len(files))
+            if CHROMA_PERSIST_DIR.exists():
+                shutil.rmtree(CHROMA_PERSIST_DIR)
+            CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+            vectorstore = Chroma.from_documents(
+                documents=_build_documents(files),
+                embedding=embeddings,
+                persist_directory=str(CHROMA_PERSIST_DIR),
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": _VECTORSTORE_SCHEMA_VERSION,
+                        "signature": signature,
+                        "document_count": len(files),
+                        "files": [str(path.relative_to(KNOWLEDGE_DIR)) for path in files],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            logger.info("Chroma vectorstore rebuilt in %.2fs", time.perf_counter() - started_at)
+        else:
+            started_at = time.perf_counter()
+            logger.info("loading existing Chroma vectorstore from %s", CHROMA_PERSIST_DIR)
+            vectorstore = Chroma(
+                persist_directory=str(CHROMA_PERSIST_DIR),
+                embedding_function=embeddings,
+            )
+            logger.info("Chroma vectorstore loaded in %.2fs", time.perf_counter() - started_at)
+
+        _vectorstore_cache = vectorstore
+        _vectorstore_cache_signature = signature
         return vectorstore
 
-    return Chroma(
-        persist_directory=str(CHROMA_PERSIST_DIR),
-        embedding_function=embeddings,
-    )
+
+def warm_up_vectorstore() -> bool:
+    if not DASHSCOPE_API_KEY:
+        logger.warning("skip vectorstore warm-up: DASHSCOPE_API_KEY is not configured")
+        return False
+
+    started_at = time.perf_counter()
+    try:
+        _ensure_vectorstore(_get_dashscope_embeddings())
+    except Exception:
+        logger.warning("vectorstore warm-up failed", exc_info=True)
+        return False
+
+    logger.info("vectorstore warm-up completed in %.2fs", time.perf_counter() - started_at)
+    return True
 
 
 def _activated_categories(query: str, user_profile: Optional[Dict[str, Optional[float]]] = None) -> List[str]:
@@ -314,12 +401,7 @@ def build_rag_result(
             detail="服务器未配置 DASHSCOPE_API_KEY 环境变量",
         )
 
-    from langchain_community.embeddings import DashScopeEmbeddings
-
-    embeddings = DashScopeEmbeddings(
-        dashscope_api_key=DASHSCOPE_API_KEY,
-        model="text-embedding-v4",
-    )
+    embeddings = _get_dashscope_embeddings()
     vectorstore = _ensure_vectorstore(embeddings)
     categories = _activated_categories(query, user_profile)
     search_filter = {"category": {"$in": categories}}

@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+email-validator
+python-multipart
+passlib
+dashscope
+langchain-community
+langchain-core
+langchain-text-splitters
+chromadb
